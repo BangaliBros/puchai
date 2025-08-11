@@ -6,9 +6,11 @@ from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
 from mcp import ErrorData, McpError
 from mcp.server.auth.provider import AccessToken
-from mcp.types import TextContent, ImageContent, INVALID_PARAMS, INTERNAL_ERROR
+from mcp.types import INVALID_PARAMS
 from pydantic import BaseModel, Field
 from rooms_database import ROOMS_DB
+from cities_and_areas import CITY_SYNONYMS, AREA_SYNONYMS
+import re
 
 # --- Load environment variables ---
 load_dotenv()
@@ -42,6 +44,30 @@ class RichToolDescription(BaseModel):
     use_when: str
     side_effects: str | None = None
 
+def _cleanup_basic(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s]", "", t)
+    t = re.sub(r"_", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def normalize_city(text: str | None) -> str:
+    if not text:
+        return ""
+    t = _cleanup_basic(text)
+    return CITY_SYNONYMS.get(t, t)
+
+def normalize_area(text: str | None) -> str:
+    if not text:
+        return ""
+    t = _cleanup_basic(text)
+    return AREA_SYNONYMS.get(t, t)
+
+def normalize_amenity(a: str) -> str:
+    return _cleanup_basic(a)
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
@@ -69,7 +95,8 @@ class RoomSearchInput(BaseModel):
 RoomFinderDescription = RichToolDescription(
     description=(
         "Search available rooms/flatshares from an in-memory dataset. "
-        "Filter by city/area/pincode, max_rent, gender_pref, and amenities."
+        "Filter by city/area/pincode, max_rent, gender_pref, and amenities. "
+        "Handles common aliases like 'Bangalore'→'Bengaluru', 'Kormangala'→'Koramangala'."
     ),
     use_when="User wants to find rooms or roommates with simple filters inside WhatsApp.",
     side_effects=None,
@@ -87,15 +114,15 @@ async def room_finder(
     limit: Annotated[int, Field(description="Max results (1-50)", ge=1, le=50, default=10)] = 10,
 ) -> str:
     """
-    Search rooms in the in-memory ROOMS_DB using simple filters.
-    Returns a markdown list of matching listings.
+    Search rooms in the in-memory ROOMS_DB using deterministic normalization
+    and show the number of spots available per listing.
     """
     # Normalize inputs
-    city_n = (city or "").strip().lower()
-    area_n = (area or "").strip().lower()
+    city_n = normalize_city(city) if city else ""
+    area_n = normalize_area(area) if area else ""
     pincode_n = (pincode or "").strip()
     gender_n = (gender_pref or "").strip().capitalize() if gender_pref else None
-    req_amenities = [a.strip() for a in (amenities or []) if a.strip()]
+    req_amenities = [normalize_amenity(a) for a in (amenities or []) if a and normalize_amenity(a)]
 
     # Validate gender value if provided
     if gender_n and gender_n not in {"Male", "Female", "Any"}:
@@ -108,55 +135,73 @@ async def room_finder(
             continue
 
         loc = r.get("location", {}) or {}
-        r_city = (loc.get("city") or "").lower()
-        r_area = (loc.get("area") or "").lower()
+        r_city = normalize_city(loc.get("city") or "")
+        r_area = normalize_area(loc.get("area") or "")
         r_pincode = (loc.get("pincode") or "")
 
-        # City/Area/Pincode match (if provided)
-        if city_n and city_n not in r_city:
+        if city_n and city_n != r_city:
             continue
-        if area_n and area_n not in r_area:
+        if area_n and area_n != r_area:
             continue
         if pincode_n and pincode_n != r_pincode:
             continue
 
-        # Rent
         if max_rent is not None and r.get("rent", 10**9) > max_rent:
             continue
 
-        # Gender preference (listing says "Female" -> only match Female seekers; "Any" matches all)
         if gender_n:
             listing_gender = r.get("gender_pref", "Any")
             if listing_gender != "Any" and listing_gender != gender_n:
                 continue
 
-        # Amenities: require all requested amenities to be present
         if req_amenities:
-            r_amenities = [a.strip().lower() for a in r.get("amenities", [])]
-            if not all(a.lower() in r_amenities for a in req_amenities):
+            r_amenities = [normalize_amenity(a) for a in r.get("amenities", [])]
+            if not all(a in r_amenities for a in req_amenities):
                 continue
 
         results.append(r)
 
-    # Sort by rent ascending, then most recent date_posted
+    # Sort and limit
     results.sort(key=lambda x: (x.get("rent", 0), x.get("date_posted", "")))
-
-    # Limit results
     results = results[:limit]
 
-    # Prepare markdown output
+    # Prepare output
     if not results:
-        return "🔍 **No matching rooms found.** Try widening your filters (increase budget, remove some amenities, or search by city only)."
+        interpreted = []
+        if city_n: interpreted.append(f"city={city_n}")
+        if area_n: interpreted.append(f"area={area_n}")
+        if pincode_n: interpreted.append(f"pincode={pincode_n}")
+        if max_rent is not None: interpreted.append(f"max_rent=₹{max_rent}")
+        if gender_n: interpreted.append(f"gender={gender_n}")
+        if req_amenities: interpreted.append(f"amenities={', '.join(req_amenities)}")
+        interp_line = ("Searching with: " + ", ".join(interpreted)) if interpreted else "Searching with: (no filters)"
+        return (
+            "🔍 **No matching rooms found.**\n"
+            f"{interp_line}\n\n"
+            "Try widening your filters (increase budget, remove some amenities, or search by city only)."
+        )
+
+    interpreted = []
+    if city_n: interpreted.append(f"city={city_n}")
+    if area_n: interpreted.append(f"area={area_n}")
+    if pincode_n: interpreted.append(f"pincode={pincode_n}")
+    if max_rent is not None: interpreted.append(f"max_rent=₹{max_rent}")
+    if gender_n: interpreted.append(f"gender={gender_n}")
+    if req_amenities: interpreted.append(f"amenities={', '.join(req_amenities)}")
+    interp_line = (" • " + ", ".join(interpreted)) if interpreted else ""
 
     lines: List[str] = []
-    lines.append(f"🏠 **Room Finder Results** (showing {len(results)} result(s))\n")
+    lines.append(f"🏠 **Room Finder Results** (showing {len(results)} result(s)){interp_line}\n")
     for r in results:
         loc = r.get("location", {})
         city_s = loc.get("city") or "-"
         area_s = loc.get("area") or "-"
         pin_s = loc.get("pincode") or "-"
-        amenities_s = ", ".join(r.get("amenities", [])) or "—"
+        amenities_s = ", ".join(r.get("amenities", [])).strip() or "—"
         photo_s = r.get("photo_url") or "—"
+        spots = r.get("spots_available")  # NEW
+        spots_s = f"{spots}" if isinstance(spots, int) else "—"
+
         lines.append(
             "\n".join(
                 [
@@ -164,6 +209,7 @@ async def room_finder(
                     f"**Location:** {city_s} • {area_s} • {pin_s}",
                     f"**Rent:** ₹{r.get('rent')}/month",
                     f"**Gender Pref:** {r.get('gender_pref','Any')}",
+                    f"**Spots Available:** {spots_s}",   # NEW
                     f"**Amenities:** {amenities_s}",
                     f"**Posted:** {r.get('date_posted','—')}  •  **Expires:** {r.get('expires_at','—')}",
                     f"**Photo:** {photo_s}",
