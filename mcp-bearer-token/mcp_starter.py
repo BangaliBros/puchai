@@ -1,6 +1,7 @@
 import asyncio
 from typing import Annotated, List, Dict, Any
 import os
+from datetime import date, timedelta
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
@@ -80,9 +81,126 @@ mcp = FastMCP(
 async def validate() -> str:
     return MY_NUMBER
 
-# -------------------------
-# Room search input model
-# -------------------------
+# --- Tool: get_help (for greeting and instructions) ---
+HelpDescription = RichToolDescription(
+    description="Shows a help menu with instructions and examples for the RoomieMatch agent.",
+    use_when=(
+        "The user wants to know what commands are available or how to use the roomie bot. "
+        "Use for prompts like 'roomie instructions', 'how does this work?', 'roomie agent help', 'show examples'."
+    ),
+    side_effects=None,
+)
+
+@mcp.tool(description=HelpDescription.model_dump_json())
+async def get_help() -> str:
+    """
+    Generates a welcome message listing all available commands and how to use them.
+    """
+    welcome_message = (
+        "👋 **Welcome to the RoomieMatch Assistant!**\n\n"
+        "I can help you find a room or post one for rent.\n\n"
+        "**🔎 How to Search:**\n"
+        "Just describe what you're looking for! Examples:\n"
+        "• `Find rooms in Bengaluru`\n"
+        "• `Show me places in Koramangala under ₹20000`\n\n"
+        "**✍️ How to List a Room:**\n"
+        "Just say you want to list a room, and I'll ask for the details! Example:\n"
+        "• `I want to list a room.`\n"
+        "• `Post a flat for rent.`\n\n"
+        "To see this message again, ask for **'roomie instructions'**."
+    )
+    return welcome_message
+
+
+# ##################################################################
+# # --- UPDATED TOOL: ADD ROOM with SLOT FILLING ---
+# ##################################################################
+
+AddRoomDescription = RichToolDescription(
+    description=(
+        "Adds a new room listing to the database. If essential details like city, area, "
+        "rent, gender, or spots are missing, this tool will ask the user for them."
+    ),
+    use_when=(
+        "User expresses intent to list a property. Keywords: 'add a room', "
+        "'post my flat', 'list a room for rent', 'I have a room to offer'. "
+        "This tool can be called even if the user has not provided all the details yet."
+    ),
+    side_effects="A new entry will be added to the rooms database once all required information is collected.",
+)
+
+@mcp.tool(description=AddRoomDescription.model_dump_json())
+async def add_room(
+    city: Annotated[str | None, Field(description="The city where the room is located, e.g., 'Pune'.", default=None)] = None,
+    area: Annotated[str | None, Field(description="The specific area or neighborhood, e.g., 'Hinjewadi'.", default=None)] = None,
+    rent: Annotated[int | None, Field(description="The monthly rent in INR, e.g., 15000.", default=None)] = None,
+    gender_pref: Annotated[str | None, Field(description='The preferred gender for the tenant: "Male", "Female", or "Any".', default=None)] = None,
+    spots_available: Annotated[int | None, Field(description="The number of beds or spots available in this listing.", default=None)] = None,
+    description: Annotated[str | None, Field(description="A short, descriptive text about the room or property.", default=None)] = None,
+    pincode: Annotated[str | None, Field(description="The 6-digit pincode of the area.", default=None)] = None,
+    amenities: Annotated[List[str] | None, Field(description="A list of amenities available, e.g., ['WiFi', 'AC'].", default=None)] = None,
+) -> str:
+    """
+    Adds a new room listing. If required info is missing, it asks the user for it.
+    Otherwise, it adds the room to the in-memory DB.
+    """
+    # --- Step 1: Check for missing required information ---
+    missing_fields = []
+    if not city: missing_fields.append("city")
+    if not area: missing_fields.append("area")
+    if not rent: missing_fields.append("rent")
+    if not gender_pref: missing_fields.append("gender preference (Male, Female, or Any)")
+    if not spots_available: missing_fields.append("number of spots available")
+    if not description: missing_fields.append("a brief description")
+
+    if missing_fields:
+        # If there are missing fields, ask the user for them.
+        missing_list = ", ".join(missing_fields)
+        return f"I can help with that! To list your room, please provide the following details: **{missing_list}**."
+
+    # --- Step 2: If all fields are present, validate and process ---
+    gender_n = (gender_pref or "").strip().capitalize()
+    if gender_n not in {"Male", "Female", "Any"}:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message='gender_pref must be "Male", "Female", or "Any"'))
+
+    # Generate New ID
+    max_id = 0
+    for room in ROOMS_DB:
+        if room['id'].startswith('R') and room['id'][1:].isdigit():
+            max_id = max(max_id, int(room['id'][1:]))
+    new_id_num = max_id + 1
+    new_id = f"R{new_id_num:03d}"
+
+    # Create New Room Record
+    today = date.today()
+    new_room = {
+        "id": new_id,
+        "location": {
+            "city": city.strip(),
+            "area": area.strip(),
+            "pincode": (pincode or "").strip()
+        },
+        "rent": rent,
+        "gender_pref": gender_n,
+        "amenities": amenities or [],
+        "description": description.strip(),
+        "photo_url": None,
+        "posted_by": "user_via_mcp",
+        "date_posted": today.isoformat(),
+        "is_active": True,
+        "expires_at": (today + timedelta(days=30)).isoformat(),
+        "spots_available": spots_available
+    }
+
+    ROOMS_DB.append(new_room)
+
+    return f"✅ **Success!** Your new listing has been added with ID: `{new_id}`. It is now active and searchable for 30 days."
+
+
+# ##################################################################
+# # --- ROOM FINDER TOOL (No changes below this line) ---
+# ##################################################################
+
 class RoomSearchInput(BaseModel):
     city: str | None = Field(default=None, description="City name to filter (e.g., Bengaluru)")
     area: str | None = Field(default=None, description="Area/neighborhood to filter (e.g., Koramangala)")
@@ -98,11 +216,13 @@ RoomFinderDescription = RichToolDescription(
         "Filter by city/area/pincode, max_rent, gender_pref, and amenities. "
         "Handles common aliases like 'Bangalore'→'Bengaluru', 'Kormangala'→'Koramangala'."
     ),
-    use_when="User wants to find rooms or roommates with simple filters inside WhatsApp.",
+    use_when=(
+        "User wants to find a room, flat, or roommate. Use this to perform a search based on user criteria. "
+        "**DO NOT** use this tool if the user is asking for help, instructions, or to post a new listing."
+    ),
     side_effects=None,
 )
 
-# --- Tool: room_finder (search only) ---
 @mcp.tool(description=RoomFinderDescription.model_dump_json())
 async def room_finder(
     city: Annotated[str | None, Field(description="City filter", default=None)] = None,
@@ -124,7 +244,6 @@ async def room_finder(
     gender_n = (gender_pref or "").strip().capitalize() if gender_pref else None
     req_amenities = [normalize_amenity(a) for a in (amenities or []) if a and normalize_amenity(a)]
 
-    # Validate gender value if provided
     if gender_n and gender_n not in {"Male", "Female", "Any"}:
         raise McpError(ErrorData(code=INVALID_PARAMS, message='gender_pref must be "Male", "Female", or "Any"'))
 
@@ -161,11 +280,9 @@ async def room_finder(
 
         results.append(r)
 
-    # Sort and limit
     results.sort(key=lambda x: (x.get("rent", 0), x.get("date_posted", "")))
     results = results[:limit]
 
-    # Prepare output
     if not results:
         interpreted = []
         if city_n: interpreted.append(f"city={city_n}")
@@ -199,7 +316,7 @@ async def room_finder(
         pin_s = loc.get("pincode") or "-"
         amenities_s = ", ".join(r.get("amenities", [])).strip() or "—"
         photo_s = r.get("photo_url") or "—"
-        spots = r.get("spots_available")  # NEW
+        spots = r.get("spots_available")
         spots_s = f"{spots}" if isinstance(spots, int) else "—"
 
         lines.append(
@@ -209,7 +326,7 @@ async def room_finder(
                     f"**Location:** {city_s} • {area_s} • {pin_s}",
                     f"**Rent:** ₹{r.get('rent')}/month",
                     f"**Gender Pref:** {r.get('gender_pref','Any')}",
-                    f"**Spots Available:** {spots_s}",   # NEW
+                    f"**Spots Available:** {spots_s}",
                     f"**Amenities:** {amenities_s}",
                     f"**Posted:** {r.get('date_posted','—')}  •  **Expires:** {r.get('expires_at','—')}",
                     f"**Photo:** {photo_s}",
