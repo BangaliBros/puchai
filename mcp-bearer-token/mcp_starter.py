@@ -1,5 +1,5 @@
 import asyncio
-from typing import Annotated
+from typing import Annotated, List, Dict, Any
 import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -7,11 +7,8 @@ from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
 from mcp import ErrorData, McpError
 from mcp.server.auth.provider import AccessToken
 from mcp.types import TextContent, ImageContent, INVALID_PARAMS, INTERNAL_ERROR
-from pydantic import BaseModel, Field, AnyUrl
-
-import markdownify
-import httpx
-import readabilipy
+from pydantic import BaseModel, Field
+from rooms_database import ROOMS_DB
 
 # --- Load environment variables ---
 load_dotenv()
@@ -45,81 +42,10 @@ class RichToolDescription(BaseModel):
     use_when: str
     side_effects: str | None = None
 
-# --- Fetch Utility Class ---
-class Fetch:
-    USER_AGENT = "Puch/1.0 (Autonomous)"
-
-    @classmethod
-    async def fetch_url(
-        cls,
-        url: str,
-        user_agent: str,
-        force_raw: bool = False,
-    ) -> tuple[str, str]:
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(
-                    url,
-                    follow_redirects=True,
-                    headers={"User-Agent": user_agent},
-                    timeout=30,
-                )
-            except httpx.HTTPError as e:
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
-
-            if response.status_code >= 400:
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url} - status code {response.status_code}"))
-
-            page_raw = response.text
-
-        content_type = response.headers.get("content-type", "")
-        is_page_html = "text/html" in content_type
-
-        if is_page_html and not force_raw:
-            return cls.extract_content_from_html(page_raw), ""
-
-        return (
-            page_raw,
-            f"Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n",
-        )
-
-    @staticmethod
-    def extract_content_from_html(html: str) -> str:
-        """Extract and convert HTML content to Markdown format."""
-        ret = readabilipy.simple_json.simple_json_from_html_string(html, use_readability=True)
-        if not ret or not ret.get("content"):
-            return "<error>Page failed to be simplified from HTML</error>"
-        content = markdownify.markdownify(ret["content"], heading_style=markdownify.ATX)
-        return content
-
-    @staticmethod
-    async def google_search_links(query: str, num_results: int = 5) -> list[str]:
-        """
-        Perform a scoped DuckDuckGo search and return a list of job posting URLs.
-        (Using DuckDuckGo because Google blocks most programmatic scraping.)
-        """
-        ddg_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
-        links = []
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(ddg_url, headers={"User-Agent": Fetch.USER_AGENT})
-            if resp.status_code != 200:
-                return ["<error>Failed to perform search.</error>"]
-
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.find_all("a", class_="result__a", href=True):
-            href = a["href"]
-            if "http" in href:
-                links.append(href)
-            if len(links) >= num_results:
-                break
-
-        return links or ["<error>No results found.</error>"]
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Job Finder MCP Server",
+    "RoomieMatch MCP Server",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
@@ -128,80 +54,126 @@ mcp = FastMCP(
 async def validate() -> str:
     return MY_NUMBER
 
-# --- Tool: job_finder (now smart!) ---
-JobFinderDescription = RichToolDescription(
-    description="Smart job tool: analyze descriptions, fetch URLs, or search jobs based on free text.",
-    use_when="Use this to evaluate job descriptions or search for jobs using freeform goals.",
-    side_effects="Returns insights, fetched job descriptions, or relevant job links.",
+# -------------------------
+# Room search input model
+# -------------------------
+class RoomSearchInput(BaseModel):
+    city: str | None = Field(default=None, description="City name to filter (e.g., Bengaluru)")
+    area: str | None = Field(default=None, description="Area/neighborhood to filter (e.g., Koramangala)")
+    pincode: str | None = Field(default=None, description="Pincode to filter")
+    max_rent: int | None = Field(default=None, description="Maximum rent in INR")
+    gender_pref: str | None = Field(default=None, description='Preferred gender: "Male"|"Female"|"Any"')
+    amenities: List[str] | None = Field(default=None, description="List of required amenities, e.g., ['WiFi','AC']")
+    limit: int = Field(default=10, ge=1, le=50, description="Max results to return")
+
+RoomFinderDescription = RichToolDescription(
+    description=(
+        "Search available rooms/flatshares from an in-memory dataset. "
+        "Filter by city/area/pincode, max_rent, gender_pref, and amenities."
+    ),
+    use_when="User wants to find rooms or roommates with simple filters inside WhatsApp.",
+    side_effects=None,
 )
 
-@mcp.tool(description=JobFinderDescription.model_dump_json())
-async def job_finder(
-    user_goal: Annotated[str, Field(description="The user's goal (can be a description, intent, or freeform query)")],
-    job_description: Annotated[str | None, Field(description="Full job description text, if available.")] = None,
-    job_url: Annotated[AnyUrl | None, Field(description="A URL to fetch a job description from.")] = None,
-    raw: Annotated[bool, Field(description="Return raw HTML content if True")] = False,
+# --- Tool: room_finder (search only) ---
+@mcp.tool(description=RoomFinderDescription.model_dump_json())
+async def room_finder(
+    city: Annotated[str | None, Field(description="City filter", default=None)] = None,
+    area: Annotated[str | None, Field(description="Area filter", default=None)] = None,
+    pincode: Annotated[str | None, Field(description="Pincode filter", default=None)] = None,
+    max_rent: Annotated[int | None, Field(description="Maximum rent (INR)", default=None)] = None,
+    gender_pref: Annotated[str | None, Field(description='Preferred gender: "Male"|"Female"|"Any"', default=None)] = None,
+    amenities: Annotated[List[str] | None, Field(description="Amenities required", default=None)] = None,
+    limit: Annotated[int, Field(description="Max results (1-50)", ge=1, le=50, default=10)] = 10,
 ) -> str:
     """
-    Handles multiple job discovery methods: direct description, URL fetch, or freeform search query.
+    Search rooms in the in-memory ROOMS_DB using simple filters.
+    Returns a markdown list of matching listings.
     """
-    if job_description:
-        return (
-            f"📝 **Job Description Analysis**\n\n"
-            f"---\n{job_description.strip()}\n---\n\n"
-            f"User Goal: **{user_goal}**\n\n"
-            f"💡 Suggestions:\n- Tailor your resume.\n- Evaluate skill match.\n- Consider applying if relevant."
+    # Normalize inputs
+    city_n = (city or "").strip().lower()
+    area_n = (area or "").strip().lower()
+    pincode_n = (pincode or "").strip()
+    gender_n = (gender_pref or "").strip().capitalize() if gender_pref else None
+    req_amenities = [a.strip() for a in (amenities or []) if a.strip()]
+
+    # Validate gender value if provided
+    if gender_n and gender_n not in {"Male", "Female", "Any"}:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message='gender_pref must be "Male", "Female", or "Any"'))
+
+    # Filtering
+    results: List[Dict[str, Any]] = []
+    for r in ROOMS_DB:
+        if not r.get("is_active", False):
+            continue
+
+        loc = r.get("location", {}) or {}
+        r_city = (loc.get("city") or "").lower()
+        r_area = (loc.get("area") or "").lower()
+        r_pincode = (loc.get("pincode") or "")
+
+        # City/Area/Pincode match (if provided)
+        if city_n and city_n not in r_city:
+            continue
+        if area_n and area_n not in r_area:
+            continue
+        if pincode_n and pincode_n != r_pincode:
+            continue
+
+        # Rent
+        if max_rent is not None and r.get("rent", 10**9) > max_rent:
+            continue
+
+        # Gender preference (listing says "Female" -> only match Female seekers; "Any" matches all)
+        if gender_n:
+            listing_gender = r.get("gender_pref", "Any")
+            if listing_gender != "Any" and listing_gender != gender_n:
+                continue
+
+        # Amenities: require all requested amenities to be present
+        if req_amenities:
+            r_amenities = [a.strip().lower() for a in r.get("amenities", [])]
+            if not all(a.lower() in r_amenities for a in req_amenities):
+                continue
+
+        results.append(r)
+
+    # Sort by rent ascending, then most recent date_posted
+    results.sort(key=lambda x: (x.get("rent", 0), x.get("date_posted", "")))
+
+    # Limit results
+    results = results[:limit]
+
+    # Prepare markdown output
+    if not results:
+        return "🔍 **No matching rooms found.** Try widening your filters (increase budget, remove some amenities, or search by city only)."
+
+    lines: List[str] = []
+    lines.append(f"🏠 **Room Finder Results** (showing {len(results)} result(s))\n")
+    for r in results:
+        loc = r.get("location", {})
+        city_s = loc.get("city") or "-"
+        area_s = loc.get("area") or "-"
+        pin_s = loc.get("pincode") or "-"
+        amenities_s = ", ".join(r.get("amenities", [])) or "—"
+        photo_s = r.get("photo_url") or "—"
+        lines.append(
+            "\n".join(
+                [
+                    f"**ID:** `{r.get('id')}`",
+                    f"**Location:** {city_s} • {area_s} • {pin_s}",
+                    f"**Rent:** ₹{r.get('rent')}/month",
+                    f"**Gender Pref:** {r.get('gender_pref','Any')}",
+                    f"**Amenities:** {amenities_s}",
+                    f"**Posted:** {r.get('date_posted','—')}  •  **Expires:** {r.get('expires_at','—')}",
+                    f"**Photo:** {photo_s}",
+                    f"**About:** {r.get('description','')}",
+                    "---",
+                ]
+            )
         )
 
-    if job_url:
-        content, _ = await Fetch.fetch_url(str(job_url), Fetch.USER_AGENT, force_raw=raw)
-        return (
-            f"🔗 **Fetched Job Posting from URL**: {job_url}\n\n"
-            f"---\n{content.strip()}\n---\n\n"
-            f"User Goal: **{user_goal}**"
-        )
-
-    if "look for" in user_goal.lower() or "find" in user_goal.lower():
-        links = await Fetch.google_search_links(user_goal)
-        return (
-            f"🔍 **Search Results for**: _{user_goal}_\n\n" +
-            "\n".join(f"- {link}" for link in links)
-        )
-
-    raise McpError(ErrorData(code=INVALID_PARAMS, message="Please provide either a job description, a job URL, or a search query in user_goal."))
-
-
-# Image inputs and sending images
-
-MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION = RichToolDescription(
-    description="Convert an image to black and white and save it.",
-    use_when="Use this tool when the user provides an image URL and requests it to be converted to black and white.",
-    side_effects="The image will be processed and saved in a black and white format.",
-)
-
-@mcp.tool(description=MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION.model_dump_json())
-async def make_img_black_and_white(
-    puch_image_data: Annotated[str, Field(description="Base64-encoded image data to convert to black and white")] = None,
-) -> list[TextContent | ImageContent]:
-    import base64
-    import io
-
-    from PIL import Image
-
-    try:
-        image_bytes = base64.b64decode(puch_image_data)
-        image = Image.open(io.BytesIO(image_bytes))
-
-        bw_image = image.convert("L")
-
-        buf = io.BytesIO()
-        bw_image.save(buf, format="PNG")
-        bw_bytes = buf.getvalue()
-        bw_base64 = base64.b64encode(bw_bytes).decode("utf-8")
-
-        return [ImageContent(type="image", mimeType="image/png", data=bw_base64)]
-    except Exception as e:
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
+    return "\n".join(lines)
 
 # --- Run MCP Server ---
 async def main():
