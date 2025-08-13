@@ -14,7 +14,6 @@ from rooms_database import ROOMS_DB
 from cities_and_areas import CITY_SYNONYMS, AREA_SYNONYMS
 import re
 
-# --- Load environment variables ---
 load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
@@ -23,7 +22,6 @@ MY_NUMBER = os.environ.get("MY_NUMBER")
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
 
-# --- Auth Provider ---
 class SimpleBearerAuthProvider(BearerAuthProvider):
     def __init__(self, token: str):
         k = RSAKeyPair.generate()
@@ -35,13 +33,11 @@ class SimpleBearerAuthProvider(BearerAuthProvider):
             return AccessToken(token=token, client_id="puch-client", scopes=["*"], expires_at=None)
         return None
 
-# --- Rich Tool Description model ---
 class RichToolDescription(BaseModel):
     description: str
     use_when: str
     side_effects: str | None = None
 
-# ... (Normalization functions remain the same) ...
 
 def _cleanup_basic(text: str) -> str:
     if not text: return ""
@@ -63,15 +59,15 @@ def normalize_area(text: str | None) -> str:
 def normalize_amenity(a: str) -> str:
     return _cleanup_basic(a)
 
-# --- MCP Server Setup ---
+# MCP Server Setup
 mcp = FastMCP("RoomieMatch MCP Server", auth=SimpleBearerAuthProvider(TOKEN))
 
-# --- Tool: validate (required by Puch) ---
+#Tool: validate
 @mcp.tool
 async def validate() -> str:
     return MY_NUMBER
 
-# --- Tool: get_help (UPDATED for manual keys) ---
+#Tool: get_help
 HelpDescription = RichToolDescription(
     description="Shows a help menu with instructions and examples.",
     use_when="User asks for 'help', 'instructions', 'commands', or 'how does this work?'.",
@@ -96,11 +92,8 @@ async def get_help() -> str:
     )
     return welcome_message
 
-# ##################################################################
-# # --- LISTING MANAGEMENT TOOLS (MANUAL KEY) ---
-# ##################################################################
 
-# --- Tool: Add a Room (MODIFIED) ---
+#Tool: Add a Room
 AddRoomDescription = RichToolDescription(
     description="Adds a new room listing and returns a secret management key.",
     use_when="User wants to 'add', 'post', or 'list' a room for rent.",
@@ -158,7 +151,7 @@ async def add_room(
         f"Your key is: `{management_key}`"
     )
 
-# --- Tool: Delete a Room (MODIFIED) ---
+#Tool: Delete a Room
 DeleteRoomDescription = RichToolDescription(
     description="Deletes a room listing using the room ID and secret management key.",
     use_when="User wants to 'delete' or 'remove' a specific room, providing its ID and key.",
@@ -179,7 +172,7 @@ async def delete_room(
     ROOMS_DB.remove(room)
     return f"✅ **Success!** Room listing `{room_id}` has been deleted."
 
-# --- Tool: Edit a Room (MODIFIED) ---
+# Tool: Edit a Room
 EditRoomDescription = RichToolDescription(
     description="Edits a room listing using the room ID and secret management key.",
     use_when="User wants to 'edit' or 'update' a specific room, providing its ID and key.",
@@ -219,7 +212,7 @@ async def edit_room(
 
     return f"✅ **Success!** For room `{room_id}`, updated: {', '.join(changes)}."
 
-# --- Tool: room_finder (Search only) ---
+#Tool: room_finder
 class RoomSearchInput(BaseModel):
     city: str | None = Field(default=None, description="City name to filter (e.g., Bengaluru)")
     area: str | None = Field(default=None, description="Area/neighborhood to filter (e.g., Koramangala)")
@@ -296,7 +289,6 @@ async def room_finder(
         photo_s = r.get("photo_url") or "—"
         spots = r.get("spots_available")
         spots_s = f"{spots}" if isinstance(spots, int) else "—"
-        # --- THIS IS THE CORRECTED, FULL LINE ---
         lines.append(
             "\n".join(
                 [
